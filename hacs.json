@@ -1,0 +1,8 @@
+{
+  "name": "BJC Newsletter",
+  "domains": ["sensor"],
+  "documentation": "https://github.com/Daniellamm/ha-bjc-newsletter",
+  "iot_class": "cloud_polling",
+  "render_readme": true,
+  "homeassistant": "2024.1.0"
+}

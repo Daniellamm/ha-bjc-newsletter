@@ -1,0 +1,11 @@
+# Test output
+test_output.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# macOS
+.DS_Store
