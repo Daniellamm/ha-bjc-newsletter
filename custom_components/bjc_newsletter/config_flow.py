@@ -108,9 +108,6 @@ class BJCNewsletterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class BJCNewsletterOptionsFlow(config_entries.OptionsFlow):
     """Allow updating the Gemini API key or model after setup."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.FlowResult:

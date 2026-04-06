@@ -328,7 +328,7 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
 
         # Step 3c: send to Gemini
         try:
-            markdown = await self._process_with_gemini(pdf_bytes, week_label)
+            markdown = await self._process_with_gemini(pdf_bytes, week_label, current_url)
         except Exception as err:
             _LOGGER.error("Gemini processing failed for %s: %s", slug, err)
             existing_data[DATA_STATUS] = STATUS_ERROR
@@ -488,25 +488,44 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Full-view PDF scrape failed for %s: %s", slug, err)
 
         _LOGGER.warning(
-            "Could not fetch PDF for slug '%s' — Gemini will not be called this cycle",
+            "Could not fetch PDF for slug '%s' directly — will pass URL to Gemini instead",
             slug,
         )
-        return None
+        return None  # caller will fall back to URL-based Gemini processing
 
     # ------------------------------------------------------------------
     # Gemini processing
     # ------------------------------------------------------------------
 
     async def _process_with_gemini(
-        self, pdf_bytes: bytes | None, week_label: str
+        self, pdf_bytes: bytes | None, week_label: str, newsletter_url: str = ""
     ) -> str:
         """Compress PDF and send to Gemini for schedule extraction.
 
         All Gemini calls run in an executor thread (library is synchronous).
+        If pdf_bytes is None (PDF fetch was blocked), falls back to passing the
+        Flipsnack PDF URL directly to Gemini so it can fetch it from Google's servers.
         """
+        api_key = self._entry.data[CONF_GEMINI_API_KEY]
+        model_name = self._entry.data.get(CONF_GEMINI_MODEL, DEFAULT_GEMINI_MODEL)
+        today = date.today()
+        prompt = GEMINI_PROMPT.format(
+            today=today.isoformat(),
+            week_label=week_label,
+            year=today.year,
+        )
+
         if pdf_bytes is None:
-            raise RuntimeError(
-                "No PDF content could be fetched for this newsletter edition"
+            # Direct PDF download was blocked — ask Gemini to fetch the PDF URL itself
+            slug = _slug_from_url(newsletter_url) if newsletter_url else "unknown"
+            pdf_url = FLIPSNACK_PDF_PATTERN.format(
+                account=BJC_FLIPSNACK_ACCOUNT, slug=slug
+            )
+            _LOGGER.info(
+                "PDF fetch was blocked; passing PDF URL directly to Gemini: %s", pdf_url
+            )
+            return await self.hass.async_add_executor_job(
+                self._gemini_url_fallback, api_key, model_name, pdf_url, prompt
             )
 
         # Compress/extract in executor
@@ -519,18 +538,50 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
             f"{len(content):,} chars" if isinstance(content, str) else f"{len(content) // 1_000_000} MB",
         )
 
-        api_key = self._entry.data[CONF_GEMINI_API_KEY]
-        model_name = self._entry.data.get(CONF_GEMINI_MODEL, DEFAULT_GEMINI_MODEL)
-        today = date.today()
-        prompt = GEMINI_PROMPT.format(
-            today=today.isoformat(),
-            week_label=week_label,
-            year=today.year,
-        )
-
         return await self.hass.async_add_executor_job(
             self._gemini_upload_pdf, api_key, model_name, content, prompt, week_label
         )
+
+    @staticmethod
+    def _gemini_url_fallback(
+        api_key: str,
+        model_name: str,
+        pdf_url: str,
+        prompt: str,
+    ) -> str:
+        """Ask Gemini to fetch and process the PDF directly from its URL.
+
+        Used when the HA instance cannot download the PDF (e.g. Flipsnack blocks
+        server-side requests). Gemini's servers can often fetch the URL independently.
+        """
+        from google import genai
+        from google.genai import types as genai_types
+
+        client = genai.Client(api_key=api_key)
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                genai_types.Part(
+                    file_data=genai_types.FileData(
+                        file_uri=pdf_url,
+                        mime_type="application/pdf",
+                    )
+                ),
+                prompt,
+            ],
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=16384,
+            ),
+        )
+
+        if not response.text:
+            raise RuntimeError(
+                f"Gemini returned an empty response when fetching URL: {pdf_url}"
+            )
+
+        return response.text
 
     @staticmethod
     def _gemini_upload_pdf(
