@@ -25,9 +25,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up BJC Newsletter from a config entry."""
     coordinator = BJCNewsletterCoordinator(hass, entry)
 
-    # Run the first refresh. The coordinator pre-populates from the disk cache,
-    # so if the BJC homepage is temporarily unreachable but we have cached data,
-    # we allow setup to succeed rather than blocking HA startup.
+    # Pre-populate from disk cache without blocking the event loop.
+    # This ensures sensors have data immediately on restart even before the
+    # first network poll completes.
+    await coordinator.async_load_from_cache()
+
+    # Run the first refresh. If the BJC homepage is temporarily unreachable
+    # but we have cached data, allow setup to succeed with stale data.
     try:
         await coordinator.async_config_entry_first_refresh()
     except Exception as err:

@@ -38,6 +38,7 @@ from .const import (
     FLIPSNACK_FULLVIEW_PATTERN,
     FLIPSNACK_PDF_PATTERN,
     OPT_CURRENT_NEWSLETTER_URL,
+    OPT_LAST_ATTEMPTED_URL,
     OPT_LAST_CHECKED,
     OPT_LAST_PROCESSED,
     PDF_IMAGE_QUALITY,
@@ -161,6 +162,40 @@ def _parse_schedule_from_markdown(markdown: str) -> dict[str, str]:
     return schedule
 
 
+def _extract_pdf_url_from_flipsnack_page(html: str) -> str | None:
+    """Search a Flipsnack viewer page's source for the real CDN PDF URL.
+
+    Flipsnack embeds book data as JSON in script tags. This function extracts
+    the PDF download URL using a series of patterns that cover their various
+    page formats (Nuxt, Next.js, legacy).
+    Returns the first plausible PDF URL found, or None.
+    """
+    # JSON key patterns Flipsnack uses for the PDF URL
+    json_key_patterns = [
+        r'"pdfUrl"\s*:\s*"([^"]+)"',
+        r'"pdfSrc"\s*:\s*"([^"]+)"',
+        r'"pdf_url"\s*:\s*"([^"]+)"',
+        r'"downloadUrl"\s*:\s*"([^"]+\.pdf[^"]*)"',
+        r'"source"\s*:\s*"([^"]+\.pdf[^"]*)"',
+        r'"fileUrl"\s*:\s*"([^"]+\.pdf[^"]*)"',
+        r'"originalPdf"\s*:\s*"([^"]+)"',
+    ]
+    for pattern in json_key_patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            url = m.group(1).replace("\\/", "/")
+            if url.startswith("http"):
+                return url
+
+    # Fallback: look for any HTTPS URL ending in .pdf from known CDN domains
+    cdn_pattern = r'https://(?:[^"\'<\s]*(?:amazonaws|cloudfront|flipsnack|s3)[^"\'<\s]*\.pdf[^"\'<\s]*)'
+    m = re.search(cdn_pattern, html, re.IGNORECASE)
+    if m:
+        return m.group(0).rstrip("\\")
+
+    return None
+
+
 def _compress_pdf(pdf_bytes: bytes) -> tuple[bytes, str]:
     """Compress the PDF for Gemini upload while preserving visual layout.
 
@@ -234,16 +269,12 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         self._session: aiohttp.ClientSession | None = None
         self._cache_path = Path(hass.config.path(CACHE_FILENAME))
 
-        # Pre-populate from disk cache so sensors have data immediately on restart
-        self.data = self._load_cache()
+        # Initialize with empty data; cache is loaded asynchronously in async_setup_entry
+        # via async_load_from_cache() to avoid blocking the event loop.
+        self.data = self._empty_data()
 
-    # ------------------------------------------------------------------
-    # Cache I/O
-    # ------------------------------------------------------------------
-
-    def _load_cache(self) -> dict[str, Any]:
-        """Load persisted schedule from disk. Returns safe default on failure."""
-        default: dict[str, Any] = {
+    def _empty_data(self) -> dict:
+        return {
             DATA_SCHEDULE: {},
             DATA_STATUS: STATUS_IDLE,
             DATA_NEWSLETTER_URL: self._entry.options.get(OPT_CURRENT_NEWSLETTER_URL, ""),
@@ -251,6 +282,21 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
             DATA_LAST_CHECKED: self._entry.options.get(OPT_LAST_CHECKED, ""),
             DATA_LAST_ERROR: "",
         }
+
+    async def async_load_from_cache(self) -> None:
+        """Load persisted schedule from disk without blocking the event loop."""
+        self.data = await self.hass.async_add_executor_job(self._load_cache)
+
+    # ------------------------------------------------------------------
+    # Cache I/O
+    # ------------------------------------------------------------------
+
+    def _load_cache(self) -> dict[str, Any]:
+        """Load persisted schedule from disk. Returns safe default on failure.
+
+        Must be called from an executor thread, not the event loop.
+        """
+        default = self._empty_data()
         if not self._cache_path.exists():
             return default
         try:
@@ -303,9 +349,10 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         existing_data = dict(self.data or {})
         existing_data[DATA_LAST_CHECKED] = now_iso
 
-        # Step 2: change detection
+        # Step 2: change detection — check both successfully processed URL and last attempted URL
         stored_url = self._entry.options.get(OPT_CURRENT_NEWSLETTER_URL, "")
-        if current_url and current_url == stored_url:
+        last_attempted = self._entry.options.get(OPT_LAST_ATTEMPTED_URL, "")
+        if current_url and (current_url == stored_url or current_url == last_attempted):
             _LOGGER.debug("BJC newsletter unchanged: %s", current_url)
             await self.hass.async_add_executor_job(self._save_cache, existing_data)
             self.hass.config_entries.async_update_entry(
@@ -335,6 +382,17 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
             existing_data[DATA_LAST_ERROR] = str(err)
             existing_data[DATA_LAST_CHECKED] = now_iso
             await self.hass.async_add_executor_job(self._save_cache, existing_data)
+            # Record the attempted URL so the next hourly poll doesn't retry immediately
+            # and cause a 429 retry storm. The entry stays in ERROR state until the URL
+            # changes (new newsletter) or the user manually reconfigures.
+            self.hass.config_entries.async_update_entry(
+                self._entry,
+                options={
+                    **self._entry.options,
+                    OPT_LAST_ATTEMPTED_URL: current_url,
+                    OPT_LAST_CHECKED: now_iso,
+                },
+            )
             return existing_data
 
         # Step 3d-e: parse and merge schedule
@@ -487,8 +545,36 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.debug("Full-view PDF scrape failed for %s: %s", slug, err)
 
+        # Attempt 3: scrape the viewer page for the real CDN PDF URL embedded in JavaScript
+        viewer_url = f"https://www.flipsnack.com/{BJC_FLIPSNACK_ACCOUNT}/{slug}"
+        try:
+            async with self._session.get(
+                viewer_url,
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers=headers,
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    pdf_cdn_url = _extract_pdf_url_from_flipsnack_page(html)
+                    if pdf_cdn_url:
+                        _LOGGER.debug("Found CDN PDF URL in viewer page: %s", pdf_cdn_url)
+                        async with self._session.get(
+                            pdf_cdn_url,
+                            timeout=aiohttp.ClientTimeout(total=120),
+                            headers=headers,
+                        ) as pdf_resp:
+                            if pdf_resp.status == 200:
+                                data = await pdf_resp.read()
+                                _LOGGER.info(
+                                    "PDF fetched from CDN (viewer page scrape): %d MB",
+                                    len(data) // 1_000_000,
+                                )
+                                return data
+        except Exception as err:
+            _LOGGER.debug("Viewer page CDN scrape failed for %s: %s", slug, err)
+
         _LOGGER.warning(
-            "Could not fetch PDF for slug '%s' directly — will pass URL to Gemini instead",
+            "Could not fetch PDF for slug '%s' by any method — Gemini URL fallback will be tried",
             slug,
         )
         return None  # caller will fall back to URL-based Gemini processing
@@ -516,16 +602,10 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         )
 
         if pdf_bytes is None:
-            # Direct PDF download was blocked — ask Gemini to fetch the PDF URL itself
-            slug = _slug_from_url(newsletter_url) if newsletter_url else "unknown"
-            pdf_url = FLIPSNACK_PDF_PATTERN.format(
-                account=BJC_FLIPSNACK_ACCOUNT, slug=slug
-            )
-            _LOGGER.info(
-                "PDF fetch was blocked; passing PDF URL directly to Gemini: %s", pdf_url
-            )
-            return await self.hass.async_add_executor_job(
-                self._gemini_url_fallback, api_key, model_name, pdf_url, prompt
+            raise RuntimeError(
+                "Could not download the newsletter PDF from Flipsnack by any method. "
+                "Check the integration logs for details. The PDF will be retried when "
+                "a new newsletter edition is published."
             )
 
         # Compress/extract in executor
@@ -541,47 +621,6 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         return await self.hass.async_add_executor_job(
             self._gemini_upload_pdf, api_key, model_name, content, prompt, week_label
         )
-
-    @staticmethod
-    def _gemini_url_fallback(
-        api_key: str,
-        model_name: str,
-        pdf_url: str,
-        prompt: str,
-    ) -> str:
-        """Ask Gemini to fetch and process the PDF directly from its URL.
-
-        Used when the HA instance cannot download the PDF (e.g. Flipsnack blocks
-        server-side requests). Gemini's servers can often fetch the URL independently.
-        """
-        from google import genai
-        from google.genai import types as genai_types
-
-        client = genai.Client(api_key=api_key)
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[
-                genai_types.Part(
-                    file_data=genai_types.FileData(
-                        file_uri=pdf_url,
-                        mime_type="application/pdf",
-                    )
-                ),
-                prompt,
-            ],
-            config=genai_types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=16384,
-            ),
-        )
-
-        if not response.text:
-            raise RuntimeError(
-                f"Gemini returned an empty response when fetching URL: {pdf_url}"
-            )
-
-        return response.text
 
     @staticmethod
     def _gemini_upload_pdf(

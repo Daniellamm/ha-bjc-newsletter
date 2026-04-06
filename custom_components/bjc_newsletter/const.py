@@ -11,6 +11,7 @@ CONF_GEMINI_MODEL = "gemini_model"
 OPT_CURRENT_NEWSLETTER_URL = "current_newsletter_url"
 OPT_LAST_PROCESSED = "last_processed"
 OPT_LAST_CHECKED = "last_checked"
+OPT_LAST_ATTEMPTED_URL = "last_attempted_url"  # set even on Gemini failure to prevent retry storm
 
 # Polling
 UPDATE_INTERVAL_HOURS = 1
