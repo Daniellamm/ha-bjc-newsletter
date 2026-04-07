@@ -1,0 +1,27 @@
+name: BJC Newsletter Fetcher
+description: Fetches the BJC Insider newsletter from Flipsnack using a headless browser and saves it for the BJC Newsletter integration to process.
+version: "1.0.0"
+slug: bjc_newsletter_fetcher
+url: https://github.com/daniellamm/ha-bjc-newsletter
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+init: false
+startup: services
+boot: auto
+options:
+  schedule: "0 8 * * 1"
+  bjc_homepage: "https://www.bocajewishcenter.org/"
+  flipsnack_account: "7BBDB688B7A"
+  output_folder: "/config/bjc_newsletter_pdfs"
+  log_level: "info"
+schema:
+  schedule: str
+  bjc_homepage: str
+  flipsnack_account: str
+  output_folder: str
+  log_level: list(debug|info|warning|error)
+map:
+  - config:rw

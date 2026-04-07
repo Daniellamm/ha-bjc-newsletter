@@ -13,6 +13,10 @@ OPT_LAST_PROCESSED = "last_processed"
 OPT_LAST_CHECKED = "last_checked"
 OPT_LAST_ATTEMPTED_URL = "last_attempted_url"  # set even on Gemini failure to prevent retry storm
 
+# Browserbase cloud browser (optional — enables automatic PDF fetching on HA Green)
+OPT_BROWSERBASE_API_KEY = "browserbase_api_key"
+OPT_BROWSERBASE_PROJECT_ID = "browserbase_project_id"
+
 # Polling
 UPDATE_INTERVAL_HOURS = 1
 

@@ -1,0 +1,51 @@
+name: Fetch BJC Newsletter
+
+on:
+  schedule:
+    # Every Monday at 10:00 AM UTC (6:00 AM Eastern)
+    - cron: "0 10 * * 1"
+  workflow_dispatch:
+    # Allow manual trigger from GitHub Actions UI
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install --quiet \
+            playwright>=1.40.0 \
+            pillow>=10.0.0 \
+            aiohttp>=3.9.0 \
+            beautifulsoup4>=4.12.0 \
+            "google-genai>=1.0.0"
+
+      - name: Install Playwright Chromium + system deps
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Fetch newsletter and extract schedule
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python github_runner.py
+
+      - name: Commit updated schedule.json
+        run: |
+          git config user.name "BJC Newsletter Bot"
+          git config user.email "bjc-bot@users.noreply.github.com"
+          git add schedule.json
+          git diff --staged --quiet && echo "No changes to commit" || \
+            git commit -m "chore: update newsletter schedule $(date -u +%Y-%m-%d)"
+          git push

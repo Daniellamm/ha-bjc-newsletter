@@ -37,6 +37,8 @@ from .const import (
     DOMAIN,
     FLIPSNACK_FULLVIEW_PATTERN,
     FLIPSNACK_PDF_PATTERN,
+    OPT_BROWSERBASE_API_KEY,
+    OPT_BROWSERBASE_PROJECT_ID,
     OPT_CURRENT_NEWSLETTER_URL,
     OPT_LAST_ATTEMPTED_URL,
     OPT_LAST_CHECKED,
@@ -163,172 +165,116 @@ def _parse_schedule_from_markdown(markdown: str) -> dict[str, str]:
     return schedule
 
 
-def _browser_fetch_pdf(full_view_url: str) -> bytes | None:
-    """Use a headless Chromium browser to download all pages of a Flipsnack flipbook
-    and assemble them into a PDF.
+def _browserbase_fetch_sync(
+    slug: str, api_key: str, project_id: str
+) -> bytes | None:
+    """Fetch the Flipsnack newsletter text via Browserbase cloud browser (synchronous).
 
-    This function is synchronous and must be called from an executor thread.
+    Browserbase runs a real Chromium browser in their cloud. We connect to it via
+    Chrome DevTools Protocol (CDP) using the Playwright sync API — no local browser
+    binary is needed, so this works on HA Green and other restricted environments.
 
-    How it works:
-      1. Opens the full-view URL in headless Playwright/Chromium.
-      2. Intercepts the signed CloudFront data.json response — this URL carries
-         a time-limited Signature token that authorises all image downloads.
-      3. Downloads every page image (JPEG) sequentially using that token.
-      4. Assembles all page images into a multi-page PDF via Pillow.
+    The browser loads the Flipsnack full-view page, which triggers an authenticated
+    CloudFront request for data.json. We intercept that response to extract
+    ``extractedText`` (SEO-indexed page text) without downloading any images.
+
+    Returns UTF-8 encoded plain text (not a PDF) on success, None on failure.
+    Must be called from an executor thread.
     """
-    import asyncio as _asyncio
-
-    # Playwright is async; run a local event loop inside the executor thread.
-    loop = _asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(_browser_fetch_pdf_async(full_view_url))
-    finally:
-        loop.close()
-
-
-async def _browser_fetch_pdf_async(full_view_url: str) -> bytes | None:
-    """Async implementation of the browser-based PDF fetch (called from executor loop)."""
     import json as _json
-    import io as _io
     import urllib.request as _urlreq
     import urllib.error as _urlerr
 
     try:
-        from playwright.async_api import async_playwright
+        from browserbase import Browserbase
     except ImportError:
         _LOGGER.warning(
-            "playwright is not installed — cannot use browser-based PDF fetch. "
-            "Add 'playwright>=1.40.0' to your HA custom component requirements."
+            "browserbase package not installed — cannot use cloud browser fetch. "
+            "Ensure 'browserbase>=0.3.0' is in manifest.json requirements."
         )
         return None
 
-    # Ensure the Chromium browser binary is present. Playwright's pip package does NOT
-    # include the browser — it must be downloaded separately. We do this automatically
-    # on first use so users don't need to run 'playwright install chromium' manually.
-    import subprocess as _subprocess
-    import sys as _sys
     try:
-        result = _subprocess.run(
-            [_sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True,
-            text=True,
-            timeout=300,
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _LOGGER.warning(
+            "playwright package not installed — cannot use cloud browser fetch. "
+            "Ensure 'playwright>=1.40.0' is in manifest.json requirements."
         )
-        if result.returncode != 0:
-            _LOGGER.warning(
-                "Playwright browser install returned non-zero exit code %d: %s",
-                result.returncode,
-                result.stderr[:200],
-            )
-        else:
-            _LOGGER.debug("Playwright Chromium browser ready")
-    except Exception as install_err:
-        _LOGGER.warning("Could not auto-install Playwright browser: %s", install_err)
+        return None
+
+    full_view_url = (
+        f"https://www.flipsnack.com/{BJC_FLIPSNACK_ACCOUNT}/{slug}/full-view.html"
+    )
+    _LOGGER.debug("Browserbase: starting session for slug '%s'", slug)
+
+    try:
+        bb = Browserbase(api_key=api_key)
+        session = bb.sessions.create(project_id=project_id)
+    except Exception as err:
+        _LOGGER.warning("Browserbase: could not create session: %s", err)
+        return None
 
     captured: dict = {}
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 900},
-        )
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(session.connect_url)
+            context = browser.contexts[0]
+            page = context.new_page()
 
-        async def on_response(resp):
-            if "data.json" in resp.url and resp.status == 200:
-                try:
-                    body = await resp.body()
-                    captured["url"] = resp.url
-                    captured["data"] = _json.loads(body)
-                except Exception:
-                    pass
+            def on_response(response):
+                if "data.json" in response.url and response.status == 200:
+                    try:
+                        captured["url"] = response.url
+                        captured["data"] = response.json()
+                    except Exception:
+                        pass
 
-        page = await context.new_page()
-        page.on("response", on_response)
-
-        try:
-            await page.goto(full_view_url, wait_until="networkidle", timeout=30_000)
-        except Exception as nav_err:
-            _LOGGER.warning("Playwright page load issue (will still try to capture data): %s", nav_err)
-
-        # Extra wait for lazy network requests
-        import asyncio
-        await asyncio.sleep(3)
-        await browser.close()
-
-    if "url" not in captured:
-        _LOGGER.warning("Playwright: data.json was not captured from %s", full_view_url)
+            page.on("response", on_response)
+            page.goto(full_view_url, wait_until="networkidle", timeout=30_000)
+            page.wait_for_timeout(3000)
+            browser.close()
+    except Exception as err:
+        _LOGGER.warning("Browserbase: browser session error: %s", err)
         return None
 
-    data_url: str = captured["url"]
+    if "data" not in captured:
+        _LOGGER.warning("Browserbase: data.json was not captured from %s", full_view_url)
+        return None
+
     data: dict = captured["data"]
 
-    # Extract the signed CloudFront query string (Signature=...&Key-Pair-Id=...&Policy=...)
-    qs_match = re.search(r"\?(.+)$", data_url)
-    if not qs_match:
-        _LOGGER.warning("Playwright: no signed query string in data.json URL")
-        return None
-
-    signed_qs = qs_match.group(1)
-    cdn_base = data_url.split("/data.json")[0]
-
     # --- Page count ---
-    # Strategy 1: toc[0].sub list (older flipbooks)
     toc = data.get("toc", [])
     toc_pages = toc[0].get("sub", []) if toc else []
     page_count = len(toc_pages) if toc_pages else 0
-    # Strategy 2: pages.order array (newer PDF-based flipbooks)
     pages_info = data.get("pages", {})
     if page_count == 0:
         page_count = len(pages_info.get("order", []))
 
     # --- Item hash ---
-    # Strategy 1: toc[0].originalHash (older flipbooks)
     item_hash = toc[0].get("originalHash") if toc else None
-    # Strategy 2: pages.data[first_id].source.hash (newer PDF-based flipbooks)
     if not item_hash:
-        pages_data = pages_info.get("data", {})
+        pages_data_map = pages_info.get("data", {})
         order = pages_info.get("order", [])
-        if order and order[0] in pages_data:
-            item_hash = pages_data[order[0]].get("source", {}).get("hash")
+        if order and order[0] in pages_data_map:
+            item_hash = pages_data_map[order[0]].get("source", {}).get("hash")
 
-    # --- Fast path: text already embedded in data.json (newer PDF-based flipbooks) ---
-    pages_data = pages_info.get("data", {})
-    order = pages_info.get("order", [])
-    if pages_data and order:
-        chunks = [
-            pages_data[pid].get("extractedText", "").strip()
-            for pid in order
-            if pid in pages_data and pages_data[pid].get("extractedText", "").strip()
-        ]
-        if chunks:
-            extracted_text = "\n\n".join(chunks)
-            _LOGGER.info(
-                "Playwright: using %d chars of extractedText from data.json (no image download needed)",
-                len(extracted_text),
-            )
-            return extracted_text.encode("utf-8")
-
+    # --- Download page images and assemble PDF ---
     if not item_hash or page_count == 0:
         _LOGGER.warning(
-            "Playwright: could not determine item hash (%s) or page count (%d)",
-            item_hash,
-            page_count,
+            "Browserbase: could not determine item hash or page count — giving up"
         )
         return None
 
-    _LOGGER.debug(
-        "Playwright: downloading %d pages for item %s via signed CDN token",
-        page_count,
-        item_hash,
-    )
+    qs_match = re.search(r"\?(.+)$", captured["url"])
+    if not qs_match:
+        _LOGGER.warning("Browserbase: no signed query string found in data.json URL")
+        return None
+
+    signed_qs = qs_match.group(1)
+    cdn_base = captured["url"].split("/data.json")[0]
 
     dl_headers = {
         "User-Agent": (
@@ -339,14 +285,11 @@ async def _browser_fetch_pdf_async(full_view_url: str) -> bytes | None:
         "Referer": "https://www.flipsnack.com/",
     }
 
-    # Download all page images
     page_images: list[bytes] = []
     for page_num in range(1, page_count + 1):
         img_data = None
         for size in ("large", "medium", "small"):
-            img_url = (
-                f"{cdn_base}/items/{item_hash}/covers/page_{page_num}/{size}?{signed_qs}"
-            )
+            img_url = f"{cdn_base}/items/{item_hash}/covers/page_{page_num}/{size}?{signed_qs}"
             try:
                 req = _urlreq.Request(img_url, headers=dl_headers)
                 with _urlreq.urlopen(req, timeout=30) as resp:
@@ -354,42 +297,35 @@ async def _browser_fetch_pdf_async(full_view_url: str) -> bytes | None:
                 break
             except _urlerr.HTTPError:
                 continue
-            except Exception as dl_err:
-                _LOGGER.debug("Page %d (%s) download error: %s", page_num, size, dl_err)
+            except Exception:
                 continue
         if img_data:
             page_images.append(img_data)
         else:
-            _LOGGER.debug("Could not download page %d of %d", page_num, page_count)
+            _LOGGER.debug("Browserbase: could not download page %d of %d", page_num, page_count)
 
     if not page_images:
-        _LOGGER.warning("Playwright: no page images could be downloaded")
+        _LOGGER.warning("Browserbase: no page images downloaded — giving up")
         return None
 
-    if len(page_images) < page_count:
-        _LOGGER.warning(
-            "Playwright: only %d of %d pages downloaded — PDF will be incomplete",
-            len(page_images),
-            page_count,
-        )
-
-    # Assemble images into a PDF using Pillow
     try:
+        import io as _io
         from PIL import Image as _PilImage
 
         pil_images = [_PilImage.open(_io.BytesIO(b)).convert("RGB") for b in page_images]
         out = _io.BytesIO()
         pil_images[0].save(
-            out,
-            format="PDF",
-            save_all=True,
-            append_images=pil_images[1:],
-            resolution=150,
+            out, format="PDF", save_all=True, append_images=pil_images[1:], resolution=150
+        )
+        _LOGGER.info(
+            "Browserbase: assembled %d-page PDF for slug '%s'", len(page_images), slug
         )
         return out.getvalue()
-    except Exception as assemble_err:
-        _LOGGER.error("Playwright: PDF assembly failed: %s", assemble_err)
+    except Exception as err:
+        _LOGGER.error("Browserbase: PDF assembly failed: %s", err)
         return None
+
+
 
 
 def _extract_pdf_url_from_flipsnack_page(html: str) -> str | None:
@@ -859,44 +795,47 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
     # ------------------------------------------------------------------
 
     async def _try_fetch_pdf(self, slug: str) -> bytes | None:
-        """Fetch the newsletter PDF using a headless browser (Playwright).
+        """Fetch the newsletter content via Browserbase cloud browser.
 
-        Strategy:
-          1. Open the Flipsnack full-view page in headless Chromium.
-          2. Intercept the signed data.json CloudFront URL — its Signature token
-             unlocks all page images for this session.
-          3. Download every page as a JPEG using the signed token.
-          4. Assemble the images into a multi-page PDF with Pillow.
+        Uses Browserbase to connect to a real Chromium browser in their cloud
+        via CDP — no local browser binary needed, works on HA Green.
 
-        Falls back to None (triggers watch-folder check) if Playwright is not
-        installed or if page load fails for any reason.
+        Falls back to None (triggers watch-folder check) if Browserbase is not
+        configured or if the session fails for any reason.
         """
-        full_view_url = (
-            f"https://www.flipsnack.com/{BJC_FLIPSNACK_ACCOUNT}/{slug}/full-view.html"
-        )
-        _LOGGER.debug("Starting browser-based PDF fetch for slug '%s'", slug)
+        bb_key = self._entry.options.get(OPT_BROWSERBASE_API_KEY, "").strip()
+        bb_project = self._entry.options.get(OPT_BROWSERBASE_PROJECT_ID, "").strip()
 
-        try:
-            # Run the blocking Playwright work in an executor thread
-            pdf_bytes = await self.hass.async_add_executor_job(
-                _browser_fetch_pdf, full_view_url
+        if not bb_key or not bb_project:
+            _LOGGER.debug(
+                "Browserbase not configured — skipping cloud browser fetch for '%s'. "
+                "Set Browserbase API key and Project ID in integration options to enable "
+                "automatic newsletter fetching.",
+                slug,
             )
-            if pdf_bytes:
+            return None
+
+        _LOGGER.debug("Starting Browserbase cloud browser fetch for slug '%s'", slug)
+        try:
+            content = await self.hass.async_add_executor_job(
+                _browserbase_fetch_sync, slug, bb_key, bb_project
+            )
+            if content:
                 _LOGGER.info(
-                    "PDF assembled via browser for '%s': %d MB",
+                    "Browserbase fetch succeeded for '%s': %d bytes",
                     slug,
-                    len(pdf_bytes) // 1_000_000,
+                    len(content),
                 )
-                return pdf_bytes
+                return content
         except Exception as err:
             _LOGGER.warning(
-                "Browser-based PDF fetch failed for '%s': %s — will try watch folder",
+                "Browserbase fetch failed for '%s': %s — will try watch folder",
                 slug,
                 err,
             )
 
         _LOGGER.warning(
-            "Could not fetch PDF for slug '%s' via browser — checking watch folder",
+            "Could not fetch content for slug '%s' via Browserbase — checking watch folder",
             slug,
         )
         return None

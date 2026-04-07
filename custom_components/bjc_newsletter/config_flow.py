@@ -15,6 +15,8 @@ from .const import (
     DEFAULT_GEMINI_MODEL,
     DOMAIN,
     NAME,
+    OPT_BROWSERBASE_API_KEY,
+    OPT_BROWSERBASE_PROJECT_ID,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -116,6 +118,8 @@ class BJCNewsletterOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             api_key = user_input[CONF_GEMINI_API_KEY].strip()
             model = (user_input.get(CONF_GEMINI_MODEL) or DEFAULT_GEMINI_MODEL).strip()
+            bb_key = user_input.get(OPT_BROWSERBASE_API_KEY, "").strip()
+            bb_project = user_input.get(OPT_BROWSERBASE_PROJECT_ID, "").strip()
             try:
                 await _validate_gemini_key(self.hass, api_key, model)
             except ValueError:
@@ -133,6 +137,11 @@ class BJCNewsletterOptionsFlow(config_entries.OptionsFlow):
                         CONF_GEMINI_API_KEY: api_key,
                         CONF_GEMINI_MODEL: model,
                     },
+                    options={
+                        **self.config_entry.options,
+                        OPT_BROWSERBASE_API_KEY: bb_key,
+                        OPT_BROWSERBASE_PROJECT_ID: bb_project,
+                    },
                 )
                 return self.async_create_entry(title="", data={})
 
@@ -149,6 +158,14 @@ class BJCNewsletterOptionsFlow(config_entries.OptionsFlow):
                         default=self.config_entry.data.get(
                             CONF_GEMINI_MODEL, DEFAULT_GEMINI_MODEL
                         ),
+                    ): str,
+                    vol.Optional(
+                        OPT_BROWSERBASE_API_KEY,
+                        default=self.config_entry.options.get(OPT_BROWSERBASE_API_KEY, ""),
+                    ): str,
+                    vol.Optional(
+                        OPT_BROWSERBASE_PROJECT_ID,
+                        default=self.config_entry.options.get(OPT_BROWSERBASE_PROJECT_ID, ""),
                     ): str,
                 }
             ),
