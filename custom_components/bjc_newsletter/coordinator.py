@@ -42,6 +42,7 @@ from .const import (
     OPT_LAST_CHECKED,
     OPT_LAST_PROCESSED,
     PDF_IMAGE_QUALITY,
+    PDF_WATCH_FOLDER,
     STATUS_ERROR,
     STATUS_IDLE,
     STATUS_PROCESSING,
@@ -162,6 +163,235 @@ def _parse_schedule_from_markdown(markdown: str) -> dict[str, str]:
     return schedule
 
 
+def _browser_fetch_pdf(full_view_url: str) -> bytes | None:
+    """Use a headless Chromium browser to download all pages of a Flipsnack flipbook
+    and assemble them into a PDF.
+
+    This function is synchronous and must be called from an executor thread.
+
+    How it works:
+      1. Opens the full-view URL in headless Playwright/Chromium.
+      2. Intercepts the signed CloudFront data.json response — this URL carries
+         a time-limited Signature token that authorises all image downloads.
+      3. Downloads every page image (JPEG) sequentially using that token.
+      4. Assembles all page images into a multi-page PDF via Pillow.
+    """
+    import asyncio as _asyncio
+
+    # Playwright is async; run a local event loop inside the executor thread.
+    loop = _asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_browser_fetch_pdf_async(full_view_url))
+    finally:
+        loop.close()
+
+
+async def _browser_fetch_pdf_async(full_view_url: str) -> bytes | None:
+    """Async implementation of the browser-based PDF fetch (called from executor loop)."""
+    import json as _json
+    import io as _io
+    import urllib.request as _urlreq
+    import urllib.error as _urlerr
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        _LOGGER.warning(
+            "playwright is not installed — cannot use browser-based PDF fetch. "
+            "Add 'playwright>=1.40.0' to your HA custom component requirements."
+        )
+        return None
+
+    # Ensure the Chromium browser binary is present. Playwright's pip package does NOT
+    # include the browser — it must be downloaded separately. We do this automatically
+    # on first use so users don't need to run 'playwright install chromium' manually.
+    import subprocess as _subprocess
+    import sys as _sys
+    try:
+        result = _subprocess.run(
+            [_sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            _LOGGER.warning(
+                "Playwright browser install returned non-zero exit code %d: %s",
+                result.returncode,
+                result.stderr[:200],
+            )
+        else:
+            _LOGGER.debug("Playwright Chromium browser ready")
+    except Exception as install_err:
+        _LOGGER.warning("Could not auto-install Playwright browser: %s", install_err)
+
+    captured: dict = {}
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+        )
+
+        async def on_response(resp):
+            if "data.json" in resp.url and resp.status == 200:
+                try:
+                    body = await resp.body()
+                    captured["url"] = resp.url
+                    captured["data"] = _json.loads(body)
+                except Exception:
+                    pass
+
+        page = await context.new_page()
+        page.on("response", on_response)
+
+        try:
+            await page.goto(full_view_url, wait_until="networkidle", timeout=30_000)
+        except Exception as nav_err:
+            _LOGGER.warning("Playwright page load issue (will still try to capture data): %s", nav_err)
+
+        # Extra wait for lazy network requests
+        import asyncio
+        await asyncio.sleep(3)
+        await browser.close()
+
+    if "url" not in captured:
+        _LOGGER.warning("Playwright: data.json was not captured from %s", full_view_url)
+        return None
+
+    data_url: str = captured["url"]
+    data: dict = captured["data"]
+
+    # Extract the signed CloudFront query string (Signature=...&Key-Pair-Id=...&Policy=...)
+    qs_match = re.search(r"\?(.+)$", data_url)
+    if not qs_match:
+        _LOGGER.warning("Playwright: no signed query string in data.json URL")
+        return None
+
+    signed_qs = qs_match.group(1)
+    cdn_base = data_url.split("/data.json")[0]
+
+    # --- Page count ---
+    # Strategy 1: toc[0].sub list (older flipbooks)
+    toc = data.get("toc", [])
+    toc_pages = toc[0].get("sub", []) if toc else []
+    page_count = len(toc_pages) if toc_pages else 0
+    # Strategy 2: pages.order array (newer PDF-based flipbooks)
+    pages_info = data.get("pages", {})
+    if page_count == 0:
+        page_count = len(pages_info.get("order", []))
+
+    # --- Item hash ---
+    # Strategy 1: toc[0].originalHash (older flipbooks)
+    item_hash = toc[0].get("originalHash") if toc else None
+    # Strategy 2: pages.data[first_id].source.hash (newer PDF-based flipbooks)
+    if not item_hash:
+        pages_data = pages_info.get("data", {})
+        order = pages_info.get("order", [])
+        if order and order[0] in pages_data:
+            item_hash = pages_data[order[0]].get("source", {}).get("hash")
+
+    # --- Fast path: text already embedded in data.json (newer PDF-based flipbooks) ---
+    pages_data = pages_info.get("data", {})
+    order = pages_info.get("order", [])
+    if pages_data and order:
+        chunks = [
+            pages_data[pid].get("extractedText", "").strip()
+            for pid in order
+            if pid in pages_data and pages_data[pid].get("extractedText", "").strip()
+        ]
+        if chunks:
+            extracted_text = "\n\n".join(chunks)
+            _LOGGER.info(
+                "Playwright: using %d chars of extractedText from data.json (no image download needed)",
+                len(extracted_text),
+            )
+            return extracted_text.encode("utf-8")
+
+    if not item_hash or page_count == 0:
+        _LOGGER.warning(
+            "Playwright: could not determine item hash (%s) or page count (%d)",
+            item_hash,
+            page_count,
+        )
+        return None
+
+    _LOGGER.debug(
+        "Playwright: downloading %d pages for item %s via signed CDN token",
+        page_count,
+        item_hash,
+    )
+
+    dl_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.flipsnack.com/",
+    }
+
+    # Download all page images
+    page_images: list[bytes] = []
+    for page_num in range(1, page_count + 1):
+        img_data = None
+        for size in ("large", "medium", "small"):
+            img_url = (
+                f"{cdn_base}/items/{item_hash}/covers/page_{page_num}/{size}?{signed_qs}"
+            )
+            try:
+                req = _urlreq.Request(img_url, headers=dl_headers)
+                with _urlreq.urlopen(req, timeout=30) as resp:
+                    img_data = resp.read()
+                break
+            except _urlerr.HTTPError:
+                continue
+            except Exception as dl_err:
+                _LOGGER.debug("Page %d (%s) download error: %s", page_num, size, dl_err)
+                continue
+        if img_data:
+            page_images.append(img_data)
+        else:
+            _LOGGER.debug("Could not download page %d of %d", page_num, page_count)
+
+    if not page_images:
+        _LOGGER.warning("Playwright: no page images could be downloaded")
+        return None
+
+    if len(page_images) < page_count:
+        _LOGGER.warning(
+            "Playwright: only %d of %d pages downloaded — PDF will be incomplete",
+            len(page_images),
+            page_count,
+        )
+
+    # Assemble images into a PDF using Pillow
+    try:
+        from PIL import Image as _PilImage
+
+        pil_images = [_PilImage.open(_io.BytesIO(b)).convert("RGB") for b in page_images]
+        out = _io.BytesIO()
+        pil_images[0].save(
+            out,
+            format="PDF",
+            save_all=True,
+            append_images=pil_images[1:],
+            resolution=150,
+        )
+        return out.getvalue()
+    except Exception as assemble_err:
+        _LOGGER.error("Playwright: PDF assembly failed: %s", assemble_err)
+        return None
+
+
 def _extract_pdf_url_from_flipsnack_page(html: str) -> str | None:
     """Search a Flipsnack viewer page's source for the real CDN PDF URL.
 
@@ -268,6 +498,7 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         self._entry = entry
         self._session: aiohttp.ClientSession | None = None
         self._cache_path = Path(hass.config.path(CACHE_FILENAME))
+        self._watch_folder = Path(hass.config.path(PDF_WATCH_FOLDER))
 
         # Initialize with empty data; cache is loaded asynchronously in async_setup_entry
         # via async_load_from_cache() to avoid blocking the event loop.
@@ -370,8 +601,30 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         slug = _slug_from_url(current_url)
         week_label = _week_label_from_slug(slug)
 
-        # Step 3b: fetch PDF
+        # Step 3b: fetch PDF — try remote first, then fall back to watch folder
         pdf_bytes = await self._try_fetch_pdf(slug)
+        if pdf_bytes is None:
+            pdf_bytes = await self.hass.async_add_executor_job(
+                self._check_watch_folder, existing_data.get(DATA_LAST_PROCESSED, "")
+            )
+
+        # Sanity-check: must look like a real PDF OR be UTF-8 text
+        # (browser fetch may return extractedText as plain bytes when available)
+        if pdf_bytes and not pdf_bytes[:4] == b"%PDF":
+            try:
+                decoded = pdf_bytes.decode("utf-8")
+                if len(decoded.strip()) < 200:
+                    raise ValueError("Too short to be meaningful text")
+                _LOGGER.info(
+                    "Fetched content for '%s' is plain text (%d chars) — will send as text to Gemini",
+                    slug, len(decoded),
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Fetched file for '%s' does not start with %%PDF magic bytes "
+                    "and is not valid UTF-8 text — discarding, will retry next poll", slug
+                )
+                pdf_bytes = None
 
         # Step 3c: send to Gemini
         try:
@@ -450,134 +703,203 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         soup = BeautifulSoup(html, "html.parser")
         account = BJC_FLIPSNACK_ACCOUNT
 
-        # Strategy 1: find <h2> containing "BJC Insider", then find
-        # the nearest <a href> pointing to the BJC Flipsnack account
+        # Slugs that indicate non-newsletter content — never pick these
+        EXCLUDE = {"calendar", "annual-report", "yizkor", "haggadah", "bulletin"}
+
+        # Slugs that indicate a supplemental one-off (lower priority than main newsletter)
+        SUPPLEMENT_HINTS = {"schedule", "supplement", "special", "flyer", "announcement"}
+
+        def _clean(href: str) -> str:
+            return href.split("?")[0].rstrip("/")
+
+        def _is_bjc_flipsnack(href: str) -> bool:
+            return "flipsnack.com" in href and account in href
+
+        def _is_excluded(href: str) -> bool:
+            s = _slug_from_url(href).lower()
+            return any(excl in s for excl in EXCLUDE)
+
+        def _is_supplement(href: str) -> bool:
+            s = _slug_from_url(href).lower()
+            return any(hint in s for hint in SUPPLEMENT_HINTS)
+
+        all_links = soup.find_all("a", href=True)
+
+        # Strategy 1: find <h2> containing "BJC Insider" and get its flipsnack link
         for h2 in soup.find_all("h2"):
             if "bjc insider" in h2.get_text(strip=True).lower():
                 parent = h2.parent
                 if parent:
                     for a in parent.find_all("a", href=True):
                         href = a["href"]
-                        if account in href and "flipsnack.com" in href:
-                            return href.split("?")[0].rstrip("/")
-                # Also check if the heading itself is wrapped in an anchor
-                a = h2.find("a", href=True)
-                if a and account in a["href"]:
-                    return a["href"].split("?")[0].rstrip("/")
+                        if _is_bjc_flipsnack(href) and not _is_excluded(href):
+                            _LOGGER.debug("Newsletter found via BJC Insider h2: %s", href)
+                            return _clean(href)
 
-        # Strategy 2: scan all BJC Flipsnack links, exclude non-newsletter slugs
-        EXCLUDE = {"calendar", "annual-report", "yizkor", "haggadah", "bulletin"}
-        candidates = []
-        for a in soup.find_all("a", href=True):
+        # Strategy 2: any link whose visible text is "READ IT NOW" or "READ NOW"
+        READ_NOW_PHRASES = {"read it now", "read now", "click here to read", "view now"}
+        for a in all_links:
             href = a["href"]
-            if "flipsnack.com" in href and account in href:
-                slug = _slug_from_url(href)
-                if not any(excl in slug.lower() for excl in EXCLUDE):
-                    candidates.append(href.split("?")[0].rstrip("/"))
+            if _is_bjc_flipsnack(href) and not _is_excluded(href):
+                text = a.get_text(strip=True).lower()
+                if any(phrase in text for phrase in READ_NOW_PHRASES):
+                    _LOGGER.debug("Newsletter found via 'Read Now' CTA: %s", href)
+                    return _clean(href)
 
-        if candidates:
-            return candidates[0]
+        # Strategy 3: all non-excluded BJC flipsnack links — prefer main newsletters
+        # over supplement-like slugs
+        main_candidates = []
+        supplement_candidates = []
+        for a in all_links:
+            href = a["href"]
+            if _is_bjc_flipsnack(href) and not _is_excluded(href):
+                url = _clean(href)
+                if _is_supplement(href):
+                    supplement_candidates.append(url)
+                else:
+                    main_candidates.append(url)
+
+        if main_candidates:
+            _LOGGER.debug("Newsletter found via main candidate scan: %s", main_candidates[0])
+            return main_candidates[0]
+
+        if supplement_candidates:
+            _LOGGER.debug(
+                "Newsletter found via supplement fallback (no main candidate): %s",
+                supplement_candidates[0],
+            )
+            return supplement_candidates[0]
 
         raise UpdateFailed("Could not find BJC Insider newsletter link on homepage")
+
+    # ------------------------------------------------------------------
+    # PDF watch folder
+    # ------------------------------------------------------------------
+
+    def _check_watch_folder(self, last_processed_iso: str) -> bytes | None:
+        """Scan the PDF watch folder for a PDF newer than the last processed time.
+
+        The watch folder is at ``{HA config}/bjc_newsletter_pdfs/``.  Users
+        download the newsletter PDF from Flipsnack via their browser and drop it
+        there.  The integration picks up the newest file automatically.
+
+        Must be called from an executor thread (uses blocking file I/O).
+        Returns the PDF bytes if a suitable file is found, else None.
+        """
+        if not self._watch_folder.exists():
+            try:
+                self._watch_folder.mkdir(parents=True, exist_ok=True)
+                _LOGGER.info(
+                    "Created PDF watch folder: %s — place newsletter PDFs here "
+                    "to process them automatically when remote download is unavailable.",
+                    self._watch_folder,
+                )
+            except OSError as err:
+                _LOGGER.warning("Could not create watch folder %s: %s", self._watch_folder, err)
+            return None
+
+        # Find all PDFs in the folder, sorted newest-first
+        pdfs = sorted(
+            self._watch_folder.glob("*.pdf"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        if not pdfs:
+            _LOGGER.debug(
+                "PDF watch folder '%s' is empty — no local PDF to process. "
+                "Download the newsletter from Flipsnack and place the PDF here.",
+                self._watch_folder,
+            )
+            return None
+
+        newest = pdfs[0]
+
+        # If we have a last-processed timestamp, skip files older than that.
+        # Use timestamps (floats) to avoid timezone-aware vs naive datetime comparison.
+        if last_processed_iso:
+            try:
+                last_processed_dt = datetime.fromisoformat(last_processed_iso)
+                # Convert both sides to UTC timestamps to avoid tz-aware vs naive mismatch
+                import calendar as _cal
+                if last_processed_dt.tzinfo is not None:
+                    last_processed_ts = last_processed_dt.timestamp()
+                else:
+                    last_processed_ts = _cal.timegm(last_processed_dt.timetuple())
+                file_mtime_ts = newest.stat().st_mtime
+                if file_mtime_ts <= last_processed_ts:
+                    _LOGGER.debug(
+                        "Watch folder PDF '%s' (modified %s) is not newer than "
+                        "last processed time (%s) — skipping.",
+                        newest.name,
+                        file_mtime.isoformat(timespec="seconds"),
+                        last_processed_iso,
+                    )
+                    return None
+            except (ValueError, OSError):
+                pass  # If timestamp parse fails, proceed with the file
+
+        try:
+            pdf_bytes = newest.read_bytes()
+            if len(pdf_bytes) < 1000:
+                _LOGGER.warning("Watch folder PDF '%s' is too small (%d bytes) — skipping.", newest.name, len(pdf_bytes))
+                return None
+            _LOGGER.info(
+                "Using PDF from watch folder: '%s' (%d MB)",
+                newest.name,
+                len(pdf_bytes) // 1_000_000,
+            )
+            return pdf_bytes
+        except OSError as err:
+            _LOGGER.warning("Could not read watch folder PDF '%s': %s", newest, err)
+            return None
 
     # ------------------------------------------------------------------
     # PDF acquisition
     # ------------------------------------------------------------------
 
     async def _try_fetch_pdf(self, slug: str) -> bytes | None:
-        """Attempt to fetch the newsletter PDF. Returns bytes or None."""
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": f"https://www.flipsnack.com/{BJC_FLIPSNACK_ACCOUNT}/{slug}",
-        }
+        """Fetch the newsletter PDF using a headless browser (Playwright).
 
-        # Attempt 1: direct PDF URL
-        pdf_url = FLIPSNACK_PDF_PATTERN.format(account=BJC_FLIPSNACK_ACCOUNT, slug=slug)
-        try:
-            async with self._session.get(
-                pdf_url,
-                timeout=aiohttp.ClientTimeout(total=120),
-                headers=headers,
-            ) as resp:
-                if resp.status == 200:
-                    ct = resp.headers.get("Content-Type", "")
-                    if "pdf" in ct or "octet-stream" in ct:
-                        data = await resp.read()
-                        _LOGGER.info("PDF fetched directly: %d MB", len(data) // 1_000_000)
-                        return data
-        except Exception as err:
-            _LOGGER.debug("Direct PDF URL failed for %s: %s", slug, err)
+        Strategy:
+          1. Open the Flipsnack full-view page in headless Chromium.
+          2. Intercept the signed data.json CloudFront URL — its Signature token
+             unlocks all page images for this session.
+          3. Download every page as a JPEG using the signed token.
+          4. Assemble the images into a multi-page PDF with Pillow.
 
-        # Attempt 2: scrape the full-view page for a PDF link
-        full_view_url = FLIPSNACK_FULLVIEW_PATTERN.format(
-            account=BJC_FLIPSNACK_ACCOUNT, slug=slug
+        Falls back to None (triggers watch-folder check) if Playwright is not
+        installed or if page load fails for any reason.
+        """
+        full_view_url = (
+            f"https://www.flipsnack.com/{BJC_FLIPSNACK_ACCOUNT}/{slug}/full-view.html"
         )
-        try:
-            from bs4 import BeautifulSoup
+        _LOGGER.debug("Starting browser-based PDF fetch for slug '%s'", slug)
 
-            async with self._session.get(
-                full_view_url,
-                timeout=aiohttp.ClientTimeout(total=30),
-                headers=headers,
-            ) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    for a in soup.find_all("a", href=True):
-                        href = a["href"]
-                        if ".pdf" in href.lower() or "download" in href.lower():
-                            async with self._session.get(
-                                href,
-                                timeout=aiohttp.ClientTimeout(total=120),
-                                headers=headers,
-                            ) as pdf_resp:
-                                if pdf_resp.status == 200:
-                                    data = await pdf_resp.read()
-                                    _LOGGER.info(
-                                        "PDF fetched from full-view page: %d MB",
-                                        len(data) // 1_000_000,
-                                    )
-                                    return data
-        except Exception as err:
-            _LOGGER.debug("Full-view PDF scrape failed for %s: %s", slug, err)
-
-        # Attempt 3: scrape the viewer page for the real CDN PDF URL embedded in JavaScript
-        viewer_url = f"https://www.flipsnack.com/{BJC_FLIPSNACK_ACCOUNT}/{slug}"
         try:
-            async with self._session.get(
-                viewer_url,
-                timeout=aiohttp.ClientTimeout(total=30),
-                headers=headers,
-            ) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    pdf_cdn_url = _extract_pdf_url_from_flipsnack_page(html)
-                    if pdf_cdn_url:
-                        _LOGGER.debug("Found CDN PDF URL in viewer page: %s", pdf_cdn_url)
-                        async with self._session.get(
-                            pdf_cdn_url,
-                            timeout=aiohttp.ClientTimeout(total=120),
-                            headers=headers,
-                        ) as pdf_resp:
-                            if pdf_resp.status == 200:
-                                data = await pdf_resp.read()
-                                _LOGGER.info(
-                                    "PDF fetched from CDN (viewer page scrape): %d MB",
-                                    len(data) // 1_000_000,
-                                )
-                                return data
+            # Run the blocking Playwright work in an executor thread
+            pdf_bytes = await self.hass.async_add_executor_job(
+                _browser_fetch_pdf, full_view_url
+            )
+            if pdf_bytes:
+                _LOGGER.info(
+                    "PDF assembled via browser for '%s': %d MB",
+                    slug,
+                    len(pdf_bytes) // 1_000_000,
+                )
+                return pdf_bytes
         except Exception as err:
-            _LOGGER.debug("Viewer page CDN scrape failed for %s: %s", slug, err)
+            _LOGGER.warning(
+                "Browser-based PDF fetch failed for '%s': %s — will try watch folder",
+                slug,
+                err,
+            )
 
         _LOGGER.warning(
-            "Could not fetch PDF for slug '%s' by any method — Gemini URL fallback will be tried",
+            "Could not fetch PDF for slug '%s' via browser — checking watch folder",
             slug,
         )
-        return None  # caller will fall back to URL-based Gemini processing
+        return None
 
     # ------------------------------------------------------------------
     # Gemini processing
@@ -603,9 +925,24 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
 
         if pdf_bytes is None:
             raise RuntimeError(
-                "Could not download the newsletter PDF from Flipsnack by any method. "
-                "Check the integration logs for details. The PDF will be retried when "
-                "a new newsletter edition is published."
+                "Could not obtain the newsletter PDF. "
+                f"To fix this: download the newsletter PDF from Flipsnack in your "
+                f"browser, then copy it into the HA config folder at "
+                f"'{PDF_WATCH_FOLDER}/' — the integration will pick it up automatically. "
+                "Remote download will be retried when a new newsletter is detected."
+            )
+
+        # Check if this is plain text (extractedText path) rather than a real PDF.
+        # If so, skip compression and use the inline text Gemini path.
+        is_plain_text = pdf_bytes[:4] != b"%PDF"
+        if is_plain_text:
+            text_content = pdf_bytes.decode("utf-8", errors="replace")
+            _LOGGER.info(
+                "Sending plain text content to Gemini (%d chars, no file upload needed)",
+                len(text_content),
+            )
+            return await self.hass.async_add_executor_job(
+                self._gemini_text_inline, api_key, model_name, text_content, prompt
             )
 
         # Compress/extract in executor
@@ -613,9 +950,9 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
             _compress_pdf, pdf_bytes
         )
         _LOGGER.info(
-            "PDF prepared for Gemini using method '%s' (%s)",
+            "PDF prepared for Gemini using method '%s' (%d MB)",
             method,
-            f"{len(content):,} chars" if isinstance(content, str) else f"{len(content) // 1_000_000} MB",
+            len(content) // 1_000_000,
         )
 
         return await self.hass.async_add_executor_job(
@@ -679,5 +1016,33 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
 
         if not response.text:
             raise RuntimeError("Gemini returned an empty response (PDF path)")
+
+        return response.text
+
+    @staticmethod
+    def _gemini_text_inline(
+        api_key: str,
+        model_name: str,
+        text_content: str,
+        prompt: str,
+    ) -> str:
+        """Send plain text content directly to Gemini (no file upload needed)."""
+        from google import genai
+        from google.genai import types as genai_types
+
+        client = genai.Client(api_key=api_key)
+
+        combined = f"{prompt}\n\n---\n\nNEWSLETTER TEXT:\n{text_content}"
+        response = client.models.generate_content(
+            model=model_name,
+            contents=combined,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=16384,
+            ),
+        )
+
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response (text inline path)")
 
         return response.text

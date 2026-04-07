@@ -28,6 +28,12 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 # Cache file
 CACHE_FILENAME = "bjc_newsletter_cache.json"
 
+# PDF watch folder — place newsletter PDFs here for automatic processing.
+# Path is relative to the HA config directory (e.g. /config/bjc_newsletter_pdfs/).
+# The integration picks up the newest .pdf file in this folder that is newer
+# than the last successfully processed newsletter.
+PDF_WATCH_FOLDER = "bjc_newsletter_pdfs"
+
 # Sensor keys
 SENSOR_TODAY = "today_schedule"
 SENSOR_TOMORROW = "tomorrow_schedule"
