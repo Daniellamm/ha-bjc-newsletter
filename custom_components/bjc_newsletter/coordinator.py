@@ -875,14 +875,19 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
         Falls back to None (triggers watch-folder check) if Browserbase is not
         configured or if the session fails for any reason.
         """
-        bb_key = self._entry.options.get(OPT_BROWSERBASE_API_KEY, "").strip()
-        bb_project = self._entry.options.get(OPT_BROWSERBASE_PROJECT_ID, "").strip()
+        bb_key = (
+            self._entry.data.get(OPT_BROWSERBASE_API_KEY)
+            or self._entry.options.get(OPT_BROWSERBASE_API_KEY, "")
+        ).strip()
+        bb_project = (
+            self._entry.data.get(OPT_BROWSERBASE_PROJECT_ID)
+            or self._entry.options.get(OPT_BROWSERBASE_PROJECT_ID, "")
+        ).strip()
 
         if not bb_key or not bb_project:
-            _LOGGER.debug(
-                "Browserbase not configured — skipping cloud browser fetch for '%s'. "
-                "Set Browserbase API key and Project ID in integration options to enable "
-                "automatic newsletter fetching.",
+            _LOGGER.warning(
+                "Browserbase credentials missing — cannot fetch newsletter for '%s'. "
+                "Reconfigure the integration to add your Browserbase API key and Project ID.",
                 slug,
             )
             return None

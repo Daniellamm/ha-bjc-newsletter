@@ -2,11 +2,13 @@
   "config": {
     "step": {
       "user": {
-        "title": "Connect to Gemini AI",
-        "description": "Enter your Google Gemini API key. The integration will use Gemini to extract the weekly schedule from the BJC newsletter PDF. Get a free key at https://aistudio.google.com/apikey",
+        "title": "BJC Newsletter Setup",
+        "description": "Enter your API credentials. Gemini extracts the schedule from the newsletter PDF. Browserbase provides a cloud browser to fetch it. Both are required.",
         "data": {
           "gemini_api_key": "Gemini API Key",
-          "gemini_model": "Gemini Model (optional)"
+          "gemini_model": "Gemini Model (optional)",
+          "browserbase_api_key": "Browserbase API Key",
+          "browserbase_project_id": "Browserbase Project ID"
         }
       }
     },

@@ -25,6 +25,8 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_GEMINI_API_KEY): str,
         vol.Optional(CONF_GEMINI_MODEL, default=DEFAULT_GEMINI_MODEL): str,
+        vol.Required(OPT_BROWSERBASE_API_KEY): str,
+        vol.Required(OPT_BROWSERBASE_PROJECT_ID): str,
     }
 )
 
@@ -70,6 +72,8 @@ class BJCNewsletterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             api_key = user_input[CONF_GEMINI_API_KEY].strip()
             model = user_input.get(CONF_GEMINI_MODEL, DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+            bb_key = user_input[OPT_BROWSERBASE_API_KEY].strip()
+            bb_project = user_input[OPT_BROWSERBASE_PROJECT_ID].strip()
 
             try:
                 await _validate_gemini_key(self.hass, api_key, model)
@@ -89,6 +93,8 @@ class BJCNewsletterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data={
                         CONF_GEMINI_API_KEY: api_key,
                         CONF_GEMINI_MODEL: model,
+                        OPT_BROWSERBASE_API_KEY: bb_key,
+                        OPT_BROWSERBASE_PROJECT_ID: bb_project,
                     },
                 )
 
@@ -136,9 +142,6 @@ class BJCNewsletterOptionsFlow(config_entries.OptionsFlow):
                         **self.config_entry.data,
                         CONF_GEMINI_API_KEY: api_key,
                         CONF_GEMINI_MODEL: model,
-                    },
-                    options={
-                        **self.config_entry.options,
                         OPT_BROWSERBASE_API_KEY: bb_key,
                         OPT_BROWSERBASE_PROJECT_ID: bb_project,
                     },
@@ -159,13 +162,13 @@ class BJCNewsletterOptionsFlow(config_entries.OptionsFlow):
                             CONF_GEMINI_MODEL, DEFAULT_GEMINI_MODEL
                         ),
                     ): str,
-                    vol.Optional(
+                    vol.Required(
                         OPT_BROWSERBASE_API_KEY,
-                        default=self.config_entry.options.get(OPT_BROWSERBASE_API_KEY, ""),
+                        default=self.config_entry.data.get(OPT_BROWSERBASE_API_KEY, ""),
                     ): str,
-                    vol.Optional(
+                    vol.Required(
                         OPT_BROWSERBASE_PROJECT_ID,
-                        default=self.config_entry.options.get(OPT_BROWSERBASE_PROJECT_ID, ""),
+                        default=self.config_entry.data.get(OPT_BROWSERBASE_PROJECT_ID, ""),
                     ): str,
                 }
             ),
