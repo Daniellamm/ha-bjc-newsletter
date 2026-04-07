@@ -22,11 +22,13 @@
   "options": {
     "step": {
       "init": {
-        "title": "Update Gemini settings",
-        "description": "Update your Gemini API key or model.",
+        "title": "Update settings",
+        "description": "Update your Gemini API key or model. Optionally add Browserbase credentials to enable automatic newsletter fetching on HA Green and other restricted environments. Get a free Browserbase account (no credit card) at https://www.browserbase.com",
         "data": {
           "gemini_api_key": "Gemini API Key",
-          "gemini_model": "Gemini Model"
+          "gemini_model": "Gemini Model",
+          "browserbase_api_key": "Browserbase API Key (optional)",
+          "browserbase_project_id": "Browserbase Project ID (optional)"
         }
       }
     },

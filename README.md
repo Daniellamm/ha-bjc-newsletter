@@ -6,11 +6,12 @@ A custom Home Assistant integration that automatically fetches the weekly [Boca 
 
 - Polls the BJC website **every hour** for a new newsletter edition
 - Detects changes automatically — only processes when a new edition is published (~weekly)
-- Uses a **real headless browser** (Playwright + Chromium) to download the newsletter PDF, bypassing all CDN restrictions
-- Compresses page images before sending to Gemini (~4 MB)
+- Uses **Browserbase** (a cloud browser service) to download the newsletter PDF — works on **HA Green** and all other Home Assistant installations with no add-ons required
+- Assembles the newsletter pages into a PDF and sends it to Google Gemini AI
 - Extracts the complete day-by-day schedule including prayer times, classes, and events
 - Excludes Yahrzeit notices, sponsorships, and advertisements
 - Exposes **today's** and **tomorrow's** schedule as separate sensors
+- Falls back to a manual PDF watch folder if Browserbase is not configured
 - Persists the schedule across Home Assistant restarts
 
 ## Sensors
@@ -24,7 +25,8 @@ A custom Home Assistant integration that automatically fetches the weekly [Boca 
 ## Requirements
 
 - Home Assistant 2024.1.0 or newer
-- A [Google Gemini API key](https://aistudio.google.com/apikey) (paid tier recommended for reliable production use)
+- A [Google Gemini API key](https://aistudio.google.com/apikey)
+- A [Browserbase account](https://www.browserbase.com) (free, no credit card required) for automatic PDF fetching
 
 ## Installation via HACS
 
@@ -34,8 +36,7 @@ A custom Home Assistant integration that automatically fetches the weekly [Boca 
 4. Restart Home Assistant
 5. Go to **Settings → Devices & Services → Add Integration** and search for **BJC Newsletter**
 6. Enter your Gemini API key when prompted
-
-> **Note:** The first time the integration fetches a newsletter, it will automatically download the Chromium browser (~100 MB). This takes about 1–2 minutes and only happens once. Home Assistant may appear to be processing for longer than usual on the very first run.
+7. After setup, go to **Configure** and add your Browserbase credentials (see below)
 
 ## Manual Installation
 
@@ -43,6 +44,38 @@ A custom Home Assistant integration that automatically fetches the weekly [Boca 
 2. Restart Home Assistant
 3. Go to **Settings → Devices & Services → Add Integration → BJC Newsletter**
 4. Enter your Gemini API key
+5. After setup, go to **Configure** and add your Browserbase credentials (see below)
+
+## Browserbase Setup (Required for Automatic Fetching)
+
+Browserbase runs a real Chromium browser in their cloud. The integration connects to it remotely — no browser binary is installed on your Home Assistant device.
+
+**Free tier: 1 browser hour/month. The integration uses ~3 minutes/month (4 newsletters × 45 sec). No credit card required.**
+
+1. Go to [browserbase.com](https://www.browserbase.com) and sign up for a free account
+2. From your dashboard, copy your **API Key** and **Project ID**
+3. In Home Assistant: **Settings → Devices & Services → BJC Newsletter → Configure**
+4. Paste both values into the Browserbase fields and save
+
+That's it — the integration will use Browserbase automatically whenever a new newsletter is detected.
+
+## Configuration
+
+During initial setup you will be asked for:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| Gemini API Key | Yes | — | Your Google Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) |
+| Gemini Model | No | `gemini-2.5-flash` | Model to use for schedule extraction |
+
+After setup, go to **Configure** to also set:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| Browserbase API Key | No | — | Enables automatic PDF fetching via cloud browser |
+| Browserbase Project ID | No | — | Your Browserbase project ID |
+
+To update any setting, go to **Settings → Devices & Services → BJC Newsletter → Configure**.
 
 ## Dashboard Usage
 
@@ -60,32 +93,21 @@ For a two-card layout showing today and tomorrow:
 type: vertical-stack
 cards:
   - type: markdown
-    title: "📅 Today's Schedule"
+    title: "Today's Schedule"
     content: >
       {{ state_attr('sensor.bjc_today_schedule', 'schedule') | default('No schedule available') }}
   - type: markdown
-    title: "📅 Tomorrow's Schedule"
+    title: "Tomorrow's Schedule"
     content: >
       {{ state_attr('sensor.bjc_tomorrow_schedule', 'schedule') | default('No schedule available') }}
 ```
-
-## Configuration
-
-During setup you will be asked for:
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| Gemini API Key | Yes | — | Your Google Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) |
-| Gemini Model | No | `gemini-2.5-flash` | Model to use for schedule extraction |
-
-To update the API key or model after setup, go to **Settings → Devices & Services → BJC Newsletter → Configure**.
 
 ## How It Works
 
 1. Every hour, the integration scrapes the BJC homepage for the current newsletter Flipsnack URL
 2. If the URL is unchanged from last time, nothing happens (no API calls are made)
 3. When a new newsletter is detected:
-   - A headless Chromium browser opens the Flipsnack page and captures signed CDN tokens
+   - Browserbase opens the Flipsnack page in a cloud Chromium browser and captures signed CDN tokens
    - All newsletter pages are downloaded as images using those tokens
    - The images are assembled into a PDF (~4 MB)
    - The PDF is uploaded to the Google Gemini Files API
@@ -95,13 +117,13 @@ To update the API key or model after setup, go to **Settings → Devices & Servi
 
 ## Manual PDF Fallback
 
-If automatic downloading ever fails, you can manually place the newsletter PDF in your HA config directory:
+If Browserbase is not configured, you can manually place the newsletter PDF in your HA config directory:
 
 ```
 <HA config folder>/bjc_newsletter_pdfs/
 ```
 
-The integration scans this folder every hour and automatically processes any PDF placed there. This folder is created automatically on first run.
+The integration scans this folder every hour and automatically processes any PDF placed there.
 
 To use this fallback:
 1. Open the newsletter at [flipsnack.com/7BBDB688B7A](https://www.flipsnack.com/7BBDB688B7A/)
@@ -114,8 +136,8 @@ To use this fallback:
 | Symptom | Solution |
 |---------|----------|
 | `sensor.bjc_newsletter_status` shows `error` | Check `last_error` attribute for details |
-| Schedule not updating | Verify the Gemini API key is valid and has quota |
-| "Playwright browser" errors in logs | The browser download may have failed — restart HA to retry |
+| Schedule not updating | Verify Gemini API key is valid and Browserbase credentials are set |
+| Browserbase session errors in logs | Verify your API key and Project ID in **Configure** |
 | Wrong times / missing days | Delete `<config>/bjc_newsletter_cache.json` and restart HA to force reprocess |
 | Want to force an immediate reprocess | Go to **Settings → Devices & Services → BJC Newsletter → Configure** and save |
 

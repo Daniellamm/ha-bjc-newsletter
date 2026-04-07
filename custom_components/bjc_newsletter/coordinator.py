@@ -544,23 +544,13 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
                 self._check_watch_folder, existing_data.get(DATA_LAST_PROCESSED, "")
             )
 
-        # Sanity-check: must look like a real PDF OR be UTF-8 text
-        # (browser fetch may return extractedText as plain bytes when available)
-        if pdf_bytes and not pdf_bytes[:4] == b"%PDF":
-            try:
-                decoded = pdf_bytes.decode("utf-8")
-                if len(decoded.strip()) < 200:
-                    raise ValueError("Too short to be meaningful text")
-                _LOGGER.info(
-                    "Fetched content for '%s' is plain text (%d chars) — will send as text to Gemini",
-                    slug, len(decoded),
-                )
-            except Exception:
-                _LOGGER.warning(
-                    "Fetched file for '%s' does not start with %%PDF magic bytes "
-                    "and is not valid UTF-8 text — discarding, will retry next poll", slug
-                )
-                pdf_bytes = None
+        # Sanity-check: must be a real PDF
+        if pdf_bytes and pdf_bytes[:4] != b"%PDF":
+            _LOGGER.warning(
+                "Fetched file for '%s' does not start with %%PDF magic bytes — discarding, will retry next poll",
+                slug,
+            )
+            pdf_bytes = None
 
         # Step 3c: send to Gemini
         try:
