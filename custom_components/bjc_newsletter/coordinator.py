@@ -168,17 +168,17 @@ def _parse_schedule_from_markdown(markdown: str) -> dict[str, str]:
 def _browserbase_fetch_sync(
     slug: str, api_key: str, project_id: str
 ) -> bytes | None:
-    """Fetch the Flipsnack newsletter text via Browserbase cloud browser (synchronous).
+    """Fetch the Flipsnack newsletter PDF via Browserbase cloud browser (synchronous).
 
-    Browserbase runs a real Chromium browser in their cloud. We connect to it via
-    Chrome DevTools Protocol (CDP) using the Playwright sync API — no local browser
-    binary is needed, so this works on HA Green and other restricted environments.
+    Browserbase runs a real Chromium browser in their cloud. We create a session
+    via the Browserbase SDK, then connect to its CDP endpoint using the ``websockets``
+    sync client (a core HA dependency — no extra install needed). This works on
+    HA Green and all other restricted environments.
 
     The browser loads the Flipsnack full-view page, which triggers an authenticated
-    CloudFront request for data.json. We intercept that response to extract
-    ``extractedText`` (SEO-indexed page text) without downloading any images.
+    CloudFront request for data.json. We intercept that URL, download the JSON
+    directly, then download each page image and assemble a PDF.
 
-    Returns UTF-8 encoded plain text (not a PDF) on success, None on failure.
     Must be called from an executor thread.
     """
     import json as _json
@@ -194,15 +194,6 @@ def _browserbase_fetch_sync(
         )
         return None
 
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        _LOGGER.warning(
-            "playwright package not installed — cannot use cloud browser fetch. "
-            "Ensure 'playwright>=1.40.0' is in manifest.json requirements."
-        )
-        return None
-
     full_view_url = (
         f"https://www.flipsnack.com/{BJC_FLIPSNACK_ACCOUNT}/{slug}/full-view.html"
     )
@@ -215,28 +206,119 @@ def _browserbase_fetch_sync(
         _LOGGER.warning("Browserbase: could not create session: %s", err)
         return None
 
+    _LOGGER.debug("Browserbase: session created: %s", session.id)
+
+    # Connect to the Browserbase CDP endpoint via websockets (core HA dep, no pip install)
+    try:
+        from websockets.sync.client import connect as _ws_connect
+    except ImportError:
+        _LOGGER.warning("websockets package not available — cannot connect to Browserbase CDP")
+        return None
+
     captured: dict = {}
 
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.connect_over_cdp(session.connect_url)
-            context = browser.contexts[0]
-            page = context.new_page()
+        # CDP message helpers
+        _msg_id = 0
+        _event_buf: list = []
 
-            def on_response(response):
-                if "data.json" in response.url and response.status == 200:
-                    try:
-                        captured["url"] = response.url
-                        captured["data"] = response.json()
-                    except Exception:
-                        pass
+        def _send(ws, method, params=None, session_id=None):
+            nonlocal _msg_id
+            _msg_id += 1
+            mid = _msg_id
+            msg = {"id": mid, "method": method, "params": params or {}}
+            if session_id:
+                msg["sessionId"] = session_id
+            ws.send(_json.dumps(msg))
+            # Drain messages until we get our result; buffer any events
+            while True:
+                raw = ws.recv(timeout=15)
+                data = _json.loads(raw)
+                if data.get("id") == mid:
+                    return data.get("result", {})
+                _event_buf.append(data)
 
-            page.on("response", on_response)
-            page.goto(full_view_url, wait_until="networkidle", timeout=30_000)
-            page.wait_for_timeout(3000)
-            browser.close()
+        with _ws_connect(session.connect_url) as ws:
+            # Attach to the existing page target Browserbase creates for each session
+            targets = _send(ws, "Target.getTargets")
+            page_target = next(
+                (t for t in targets.get("targetInfos", []) if t["type"] == "page"),
+                None,
+            )
+            if not page_target:
+                _LOGGER.warning("Browserbase: no page target found in session")
+                return None
+
+            attach = _send(ws, "Target.attachToTarget",
+                           {"targetId": page_target["targetId"], "flatten": True})
+            sid = attach.get("sessionId")
+            if not sid:
+                _LOGGER.warning("Browserbase: could not attach to page target")
+                return None
+
+            _send(ws, "Network.enable", {}, session_id=sid)
+            _send(ws, "Page.navigate", {"url": full_view_url}, session_id=sid)
+
+            # Listen for the signed data.json URL — download its body directly via urllib
+            deadline = time.time() + 35
+            data_json_url = None
+
+            while time.time() < deadline and not data_json_url:
+                # Check already-buffered events first
+                for evt in list(_event_buf):
+                    if (evt.get("sessionId") == sid
+                            and evt.get("method") == "Network.responseReceived"):
+                        url = evt["params"]["response"]["url"]
+                        if "data.json" in url and evt["params"]["response"]["status"] == 200:
+                            data_json_url = url
+                            break
+                if data_json_url:
+                    break
+                try:
+                    raw = ws.recv(timeout=1.0)
+                except TimeoutError:
+                    continue
+                evt = _json.loads(raw)
+                if (evt.get("sessionId") == sid
+                        and evt.get("method") == "Network.responseReceived"):
+                    url = evt["params"]["response"]["url"]
+                    if "data.json" in url and evt["params"]["response"]["status"] == 200:
+                        data_json_url = url
+                else:
+                    _event_buf.append(evt)
+
+            time.sleep(3)  # let page fully settle before closing
+
     except Exception as err:
-        _LOGGER.warning("Browserbase: browser session error: %s", err)
+        _LOGGER.warning("Browserbase: CDP session error: %s", err)
+        return None
+
+    if not data_json_url:
+        _LOGGER.warning("Browserbase: data.json URL was not captured from %s", full_view_url)
+        return None
+
+    # Download data.json directly — the signed CloudFront URL is valid for ~20 min
+    try:
+        dl_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.flipsnack.com/",
+            "Accept-Encoding": "identity",
+        }
+        req = _urlreq.Request(data_json_url, headers=dl_headers)
+        with _urlreq.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+        import gzip as _gzip
+        if raw[:2] == b"\x1f\x8b":
+            raw = _gzip.decompress(raw)
+        data: dict = _json.loads(raw)
+        captured["url"] = data_json_url
+        captured["data"] = data
+    except Exception as err:
+        _LOGGER.warning("Browserbase: failed to download data.json: %s", err)
         return None
 
     if "data" not in captured:

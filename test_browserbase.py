@@ -2,15 +2,17 @@
 """Standalone end-to-end test: Browserbase → Gemini → schedule.
 
 Run from the repo root:
-    pip install browserbase playwright google-genai pillow
+    pip install browserbase google-genai pillow
     BB_API_KEY=... BB_PROJECT_ID=... GEMINI_API_KEY=... python test_browserbase.py
 """
 
 import io
+import json
 import logging
 import os
 import re
 import sys
+import time
 import urllib.error as _urlerr
 import urllib.request as _urlreq
 
@@ -70,49 +72,97 @@ def browserbase_fetch(slug: str, api_key: str, project_id: str):
     )
     _LOGGER.info("Browserbase: starting session for slug '%s'", slug)
 
-    try:
-        from browserbase import Browserbase
-    except ImportError:
-        print("ERROR: browserbase not installed. Run: pip install browserbase")
-        sys.exit(1)
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("ERROR: playwright not installed. Run: pip install playwright")
-        sys.exit(1)
+    from browserbase import Browserbase
+    from websockets.sync.client import connect as ws_connect
 
     bb = Browserbase(api_key=api_key)
     session = bb.sessions.create(project_id=project_id)
     _LOGGER.info("Browserbase: session created: %s", session.id)
 
-    captured: dict = {}
+    # CDP via websockets
+    import time as _time
+    _msg_id = 0
+    _event_buf = []
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.connect_over_cdp(session.connect_url)
-        context = browser.contexts[0]
-        page = context.new_page()
+    def _send(ws, method, params=None, session_id=None):
+        nonlocal _msg_id
+        _msg_id += 1
+        mid = _msg_id
+        msg = {"id": mid, "method": method, "params": params or {}}
+        if session_id:
+            msg["sessionId"] = session_id
+        ws.send(json.dumps(msg))
+        while True:
+            raw = ws.recv(timeout=15)
+            data = json.loads(raw)
+            if data.get("id") == mid:
+                return data.get("result", {})
+            _event_buf.append(data)
 
-        def on_response(response):
-            if "data.json" in response.url and response.status == 200:
-                try:
-                    captured["url"] = response.url
-                    captured["data"] = response.json()
-                    _LOGGER.info("Captured data.json from: %s", response.url)
-                except Exception as e:
-                    _LOGGER.warning("Failed to parse data.json: %s", e)
+    data_json_url = None
 
-        page.on("response", on_response)
+    with ws_connect(session.connect_url) as ws:
+        targets = _send(ws, "Target.getTargets")
+        page_target = next(t for t in targets.get("targetInfos", []) if t["type"] == "page")
+        attach = _send(ws, "Target.attachToTarget",
+                       {"targetId": page_target["targetId"], "flatten": True})
+        sid = attach["sessionId"]
+
+        _send(ws, "Network.enable", {}, session_id=sid)
         _LOGGER.info("Navigating to: %s", full_view_url)
-        page.goto(full_view_url, wait_until="networkidle", timeout=30_000)
-        page.wait_for_timeout(3000)
-        browser.close()
+        _send(ws, "Page.navigate", {"url": full_view_url}, session_id=sid)
 
-    if "data" not in captured:
-        print("FAIL: data.json was not captured")
+        deadline = _time.time() + 35
+        while _time.time() < deadline and not data_json_url:
+            for evt in list(_event_buf):
+                if (evt.get("sessionId") == sid
+                        and evt.get("method") == "Network.responseReceived"):
+                    url = evt["params"]["response"]["url"]
+                    if "data.json" in url and evt["params"]["response"]["status"] == 200:
+                        data_json_url = url
+                        _LOGGER.info("Captured data.json URL: %s", url[:80] + "...")
+                        break
+            if data_json_url:
+                break
+            try:
+                raw = ws.recv(timeout=1.0)
+            except TimeoutError:
+                continue
+            evt = json.loads(raw)
+            if (evt.get("sessionId") == sid
+                    and evt.get("method") == "Network.responseReceived"):
+                url = evt["params"]["response"]["url"]
+                if "data.json" in url and evt["params"]["response"]["status"] == 200:
+                    data_json_url = url
+                    _LOGGER.info("Captured data.json URL: %s", url[:80] + "...")
+            else:
+                _event_buf.append(evt)
+
+        _time.sleep(3)
+
+    if not data_json_url:
+        print("FAIL: data.json URL was not captured")
         return None
 
-    data: dict = captured["data"]
+    # Download data.json directly with the signed URL
+    dl_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.flipsnack.com/",
+        "Accept-Encoding": "identity",
+    }
+    req = _urlreq.Request(data_json_url, headers=dl_headers)
+    with _urlreq.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+    if raw[:2] == b"\x1f\x8b":
+        import gzip as _gzip
+        raw = _gzip.decompress(raw)
+    data: dict = json.loads(raw)
+
+    captured = {"url": data_json_url, "data": data}
 
     # Page count
     toc = data.get("toc", [])
