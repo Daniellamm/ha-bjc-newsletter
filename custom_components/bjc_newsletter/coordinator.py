@@ -82,6 +82,9 @@ EXCLUDE the following — do not include them in the output:
 - Yahrzeit (memorial) notices or lists
 - Sponsorship announcements or dedications
 - Advertisements or donor recognition
+- The detailed per-age-group breakdown inside Youth Groups (Child Care, Juniors, Boys, \
+Girls sub-schedules with minute-by-minute times). Instead output Youth Groups as a \
+single bullet: e.g. "* Youth Groups (Ages 2-11): 10:00am - 11:50am"
 
 Today's date for reference: {today}
 The newsletter covers the week of: {week_label}

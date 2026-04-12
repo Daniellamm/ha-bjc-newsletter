@@ -68,6 +68,11 @@ class BJCBaseSensor(CoordinatorEntity, SensorEntity):
         )
 
     @property
+    def available(self) -> bool:
+        """Stay available as long as we have any cached data, even if the last poll failed."""
+        return self.coordinator.data is not None
+
+    @property
     def _data(self) -> dict[str, Any]:
         return self.coordinator.data or {}
 
