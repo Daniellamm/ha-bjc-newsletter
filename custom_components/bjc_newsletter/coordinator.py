@@ -736,52 +736,112 @@ class BJCNewsletterCoordinator(DataUpdateCoordinator):
 
         all_links = soup.find_all("a", href=True)
 
-        # Strategy 1: find <h2> containing "BJC Insider" and get its flipsnack link
-        for h2 in soup.find_all("h2"):
-            if "bjc insider" in h2.get_text(strip=True).lower():
-                parent = h2.parent
-                if parent:
-                    for a in parent.find_all("a", href=True):
-                        href = a["href"]
-                        if _is_bjc_flipsnack(href) and not _is_excluded(href):
-                            _LOGGER.debug("Newsletter found via BJC Insider h2: %s", href)
-                            return _clean(href)
-
-        # Strategy 2: any link whose visible text is "READ IT NOW" or "READ NOW"
+        # Collect every non-excluded BJC flipsnack candidate the synagogue links
+        # to from their homepage, separated into main newsletters vs supplements.
+        # The synagogue homepage acts as the editorial gate — anything not linked
+        # there is ignored. Track the visible text of each <a> so we can fall
+        # back to "Read It Now" CTA preference if the API tiebreak is unavailable.
+        main_candidates: list[str] = []
+        supplement_candidates: list[str] = []
+        cta_text_by_url: dict[str, str] = {}
+        seen: set[str] = set()
         READ_NOW_PHRASES = {"read it now", "read now", "click here to read", "view now"}
+
         for a in all_links:
             href = a["href"]
-            if _is_bjc_flipsnack(href) and not _is_excluded(href):
-                text = a.get_text(strip=True).lower()
+            if not _is_bjc_flipsnack(href) or _is_excluded(href):
+                continue
+            cleaned = _clean(href)
+            text = a.get_text(strip=True).lower()
+            # Remember any CTA-style text we see for this URL (image links have
+            # empty text — don't overwrite a real CTA with that)
+            if text and cleaned not in cta_text_by_url:
+                cta_text_by_url[cleaned] = text
+            if cleaned in seen:
+                continue
+            seen.add(cleaned)
+            if _is_supplement(href):
+                supplement_candidates.append(cleaned)
+            else:
+                main_candidates.append(cleaned)
+
+        async def _resolve(group: list[str], label: str) -> str | None:
+            """Pick a single URL from a group of candidates."""
+            if not group:
+                return None
+            if len(group) == 1:
+                _LOGGER.debug("Newsletter found via single %s candidate: %s", label, group[0])
+                return group[0]
+            chosen = await self._pick_newest_via_flipsnack_api(group)
+            if chosen:
+                _LOGGER.debug(
+                    "Newsletter found via Flipsnack API tiebreak (newest of %d %s candidates): %s",
+                    len(group), label, chosen,
+                )
+                return chosen
+            # API unavailable — prefer a "Read It Now" CTA, else first candidate
+            for url in group:
+                text = cta_text_by_url.get(url, "")
                 if any(phrase in text for phrase in READ_NOW_PHRASES):
-                    _LOGGER.debug("Newsletter found via 'Read Now' CTA: %s", href)
-                    return _clean(href)
-
-        # Strategy 3: all non-excluded BJC flipsnack links — prefer main newsletters
-        # over supplement-like slugs
-        main_candidates = []
-        supplement_candidates = []
-        for a in all_links:
-            href = a["href"]
-            if _is_bjc_flipsnack(href) and not _is_excluded(href):
-                url = _clean(href)
-                if _is_supplement(href):
-                    supplement_candidates.append(url)
-                else:
-                    main_candidates.append(url)
-
-        if main_candidates:
-            _LOGGER.debug("Newsletter found via main candidate scan: %s", main_candidates[0])
-            return main_candidates[0]
-
-        if supplement_candidates:
+                    _LOGGER.debug(
+                        "Flipsnack API unavailable; falling back to 'Read Now' CTA among %s candidates: %s",
+                        label, url,
+                    )
+                    return url
             _LOGGER.debug(
-                "Newsletter found via supplement fallback (no main candidate): %s",
-                supplement_candidates[0],
+                "Flipsnack API unavailable and no CTA match; falling back to first %s candidate: %s",
+                label, group[0],
             )
-            return supplement_candidates[0]
+            return group[0]
+
+        chosen = await _resolve(main_candidates, "main")
+        if chosen:
+            return chosen
+        chosen = await _resolve(supplement_candidates, "supplement")
+        if chosen:
+            return chosen
 
         raise UpdateFailed("Could not find BJC Insider newsletter link on homepage")
+
+    async def _pick_newest_via_flipsnack_api(self, urls: list[str]) -> str | None:
+        """Pick the URL whose Flipsnack publication has the newest datePublished.
+
+        Returns None on any failure (network, non-200, parse error, no matches),
+        so the caller can fall back to homepage heuristics.
+        """
+        if not urls:
+            return None
+
+        api_url = (
+            "https://api.flipsnack.com/v2/publications/related"
+            f"?p=1&accountId={BJC_FLIPSNACK_ACCOUNT}&excludeId=0"
+            f"&userUrl=https%3A%2F%2Fwww.flipsnack.com%2F{BJC_FLIPSNACK_ACCOUNT}%2F"
+            "&folderHash=&searchAfter=0&searchKey="
+        )
+
+        try:
+            async with self._session.get(
+                api_url, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.debug("Flipsnack API returned HTTP %s", resp.status)
+                    return None
+                publications = await resp.json(content_type=None)
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            _LOGGER.debug("Flipsnack API call failed: %s", err)
+            return None
+
+        if not isinstance(publications, list):
+            return None
+
+        candidate_by_slug = {_slug_from_url(u): u for u in urls}
+        for pub in publications:
+            link = pub.get("directLink") or ""
+            if link.endswith(".html"):
+                link = link[: -len(".html")]
+            if link in candidate_by_slug:
+                return candidate_by_slug[link]
+        return None
 
     # ------------------------------------------------------------------
     # PDF watch folder
